@@ -1,0 +1,35 @@
+name: 盤中大戶即時監控
+
+on:
+  schedule:
+    # 設定為 UTC 時間 01:00-05:59 (台灣時間 09:00-13:59)，週一到週五，每 5 分鐘執行一次
+    - cron: '*/5 1-5 * * 1-5'
+  
+  # 保留手動執行的按鈕，方便你隨時測試
+  workflow_dispatch:
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v3
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 安裝所需套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 執行盤中掃描
+        env:
+          # 這裡已經修正為你在 GitHub 裡設定的 TELEGRAM_BOT_TOKEN
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python bot.py
