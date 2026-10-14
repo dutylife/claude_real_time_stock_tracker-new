@@ -1,12 +1,12 @@
 import os
 import csv
+import json
 import time
 import logging
 import requests
 import pandas as pd
-import numpy as np
 import yfinance as yf
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 import warnings
 warnings.filterwarnings("ignore")  # 隱藏 yfinance 的煩人警告
@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")  # 隱藏 yfinance 的煩人警告
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_IDS = os.getenv('TELEGRAM_CHAT_ID').split(',')
+CHAT_IDS = (os.getenv('TELEGRAM_CHAT_ID') or '').split(',')
 
 # ============ 參數設定 ============
 TOTAL_SESSION_MINUTES = 270          # 台股一天交易時間 9:00-13:30 = 270 分鐘
@@ -28,13 +28,23 @@ MIN_TURNOVER_FLOOR = 0.15            # 開盤極早期的最低門檻，避免�
 QUIET_PCT_LOW = -1.5                 # 策略三：價格變動區間(避免跟策略一重疊)
 QUIET_PCT_HIGH = 2.5
 AVG_VOLUME_LOOKBACK_DAYS = "20d"
+
+# ---- 大戶(法人)買進條件 ----
+CHIP_FILTER_ENABLED = True       # 設成 False 就關閉這個條件
+CHIP_LOOKBACK_DAYS = 3           # 看前幾個交易日(不含今天：證交所/櫃買的法人數字收盤後才公布，盤中拿不到今天的)
+CHIP_MIN_NET_LOTS = 0            # 外資+投信 近N日合計淨買超「大於」幾張，才算大戶有買進
+CHIP_CACHE_PATH = "chip_cache.json"
+CHIP_RETRY_SECONDS = 900         # 法人資料取得失敗時，最短間隔多久才重試
+CHIP = {'date': None, 'net': {'TWSE': {}, 'TPEX': {}}, 'ok': {'TWSE': False, 'TPEX': False},
+        'dates': [], 'last_try': 0.0}
 CACHE_PATH = "avg_volume_cache.csv"
 ALERT_STATE_PATH = "alert_state.csv"     # 跨執行的「已發送」紀錄：同一檔股票今天發過一次就不再發
 
 # ---- 交易時間判斷 ----
 TAIWAN_TZ = ZoneInfo("Asia/Taipei")
 MARKET_OPEN_TIME = dtime(9, 0)
-MARKET_CLOSE_TIME = dtime(13, 30)
+MARKET_CLOSE_TIME = dtime(13, 35)
+SUFFIX_CACHE = {}  # {股票代號: '.TW' 或 '.TWO'}，循環執行時第一輪找出後就不用再重試
 
 
 def is_market_hours():
@@ -206,24 +216,45 @@ WATCH_STOCKS = {
 
 
 def send_telegram(message):
+    """回傳 True 代表所有 chat_id 都送成功。"""
     url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
+    all_ok = True
+    sent_any_target = False
     for chat_id in CHAT_IDS:
         chat_id = chat_id.strip()
         if not chat_id:
             continue
+        sent_any_target = True
         payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'}
         try:
             resp = requests.post(url, data=payload, timeout=10)
             if resp.status_code != 200:
-                # 之前這裡完全沒檢查回傳結果，送失敗(比如HTML格式被Telegram拒絕、
-                # chat_id錯誤、bot沒有該群組的發言權限)都會被吞掉，log裡完全看不到。
-                # 現在失敗一定會印出來，才能真正查出「為什麼判斷成功了、卻沒收到訊息」。
                 print(f"❌ Telegram發送失敗 (chat_id={chat_id})："
                       f"狀態碼={resp.status_code}，回應內容={resp.text}")
+                all_ok = False
             else:
                 print(f"✅ Telegram發送成功 (chat_id={chat_id})")
         except Exception as e:
             print(f"❌ Telegram發送時發生例外 (chat_id={chat_id})：{e}")
+            all_ok = False
+    if not sent_any_target:
+        print("❌ 沒有設定任何有效的 TELEGRAM_CHAT_ID")
+        return False
+    return all_ok
+
+
+def send_alerts_chunked(header, alerts, limit=3500):
+    """Telegram單則上限4096字，超過會整則被拒絕，所以把警報切成多則(每則不超過limit字)。
+    只有全部送成功才回傳True。"""
+    chunks = []
+    cur = header
+    for a in alerts:
+        if cur != header and len(cur) + 2 + len(a) > limit:
+            chunks.append(cur)
+            cur = header
+        cur += ("" if cur == header else "\n\n") + a
+    chunks.append(cur)
+    return all([send_telegram(c) for c in chunks])
 
 
 def load_alert_state(path):
@@ -231,7 +262,7 @@ def load_alert_state(path):
     隔天自動失效。等級數字越小代表訊號越重要：1=波段轉強, 2=強勢突破, 3=異常量能。
     wave_trough_key 用來辨識「這是不是同一個波段」：只要zigzag找到的起漲低點時間戳跟上次不一樣，
     就代表是全新的一波，可以再發一次，不受發過幾次限制。"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d")
     state = {}
     if os.path.exists(path):
         try:
@@ -252,7 +283,7 @@ def load_alert_state(path):
 
 
 def save_alert_state(path, state):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d")
     try:
         with open(path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
@@ -265,7 +296,7 @@ def save_alert_state(path, state):
 
 def load_avg_volume_cache(path):
     """讀取當日快取，若不是今天的就視為過期。每筆存: 日均量(股), 日均成交金額(億)"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d")
     cache = {}
     if os.path.exists(path):
         try:
@@ -283,7 +314,7 @@ def load_avg_volume_cache(path):
 
 
 def save_avg_volume_cache(path, cache):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d")
     try:
         with open(path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
@@ -413,7 +444,15 @@ def compute_metrics(df, open_price, avg_daily_volume, avg_turnover_billion):
     """算出單一時間點(某個切片長度)的所有指標，past/now共用同一套邏輯"""
     current_price = float(df['Close'].iloc[-1])
     volume_lots = int(df['Volume'].sum() / 1000)
+    # 用最後一根K棒的實際時間算已開盤分鐘數，而不是K棒數量：
+    # 冷門股沒成交就沒有1分K，K棒數會偏少，導致時間比例被低估、金額門檻變太低。
     elapsed_minutes = max(len(df), 1)
+    try:
+        last_ts = df.index[-1].tz_convert(TAIWAN_TZ)
+        open_dt = last_ts.replace(hour=9, minute=0, second=0, microsecond=0)
+        elapsed_minutes = max(int((last_ts - open_dt).total_seconds() // 60) + 1, 1)
+    except Exception:
+        pass
 
     percent_change = ((current_price - open_price) / open_price) * 100
     turnover_billion = (current_price * volume_lots * 1000) / 100000000
@@ -530,6 +569,200 @@ def chunked_download(tickers, chunk_size=50, max_retries=3, inter_chunk_delay=1.
     return merged
 
 
+# ================== 大戶(法人)買進：資料抓取與判斷 ==================
+# 資料來源：證交所 T86(上市)、櫃買中心(上櫃)的「三大法人買賣超日報」，全市場一次一個請求，免費免 token。
+# 這裡的「大戶」定義為：外資(外陸資，不含外資自營商) + 投信，近 CHIP_LOOKBACK_DAYS 個交易日合計淨買超。
+_HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'}
+
+
+def _to_int(s):
+    s = str(s).replace(',', '').strip()
+    if s in ('', '--', '-', 'X'):
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _first_index(fields, cond):
+    for i, h in enumerate(fields):
+        if cond(h):
+            return i
+    return None
+
+
+def parse_inst_table(fields, rows, market):
+    """依「欄位名稱」找欄位位置(不寫死第幾欄，官方改欄位順序也不怕)，回傳 {代號: (外資買賣超股數, 投信買賣超股數)}。"""
+    fields = [str(f).replace(' ', '').replace('　', '').replace('（', '(').replace('）', ')') for f in fields]
+    if market == 'TWSE':
+        i_code = _first_index(fields, lambda h: '證券代號' in h or h == '代號')
+        i_for = _first_index(fields, lambda h: h.startswith('外陸資買賣超') or h.startswith('外資買賣超'))
+        i_tru = _first_index(fields, lambda h: h.startswith('投信買賣超'))
+    else:
+        i_code = _first_index(fields, lambda h: h == '代號' or '證券代號' in h)
+        i_for = _first_index(fields, lambda h: '外資及陸資(不含外資自營商)' in h and '買賣超' in h)
+        i_tru = _first_index(fields, lambda h: h.startswith('投信') and '買賣超' in h)
+    if None in (i_code, i_for, i_tru):
+        raise ValueError(f"{market} 找不到需要的欄位，實際欄位：{fields}")
+    out = {}
+    for r in rows:
+        code = str(r[i_code]).strip()
+        if code:
+            out[code] = (_to_int(r[i_for]), _to_int(r[i_tru]))
+    return out
+
+
+def _http_json(url, params):
+    resp = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_twse_day(d):
+    """某一天上市股票的法人買賣超。休市日回傳 {}；網路/格式錯誤會丟例外。"""
+    j = _http_json("https://www.twse.com.tw/rwd/zh/fund/T86",
+                   {'date': d.strftime('%Y%m%d'), 'selectType': 'ALLBUT0999', 'response': 'json'})
+    stat = str(j.get('stat', ''))
+    fields, data = j.get('fields'), j.get('data')
+    if not data and j.get('tables'):
+        fields, data = j['tables'][0].get('fields'), j['tables'][0].get('data')
+    if stat.upper() == 'OK' and data:
+        return parse_inst_table(fields, data, 'TWSE')
+    if '沒有符合' in stat or '無符合' in stat or (stat.upper() == 'OK' and not data):
+        return {}
+    raise RuntimeError(f"證交所回應異常：{stat}")
+
+
+def fetch_tpex_day(d):
+    """某一天上櫃股票的法人買賣超。沒資料回傳 {}；網路/格式錯誤會丟例外。"""
+    j = _http_json("https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
+                   {'type': 'Daily', 'sect': 'EW', 'date': d.strftime('%Y/%m/%d'), 'id': '', 'response': 'json'})
+    tables = j.get('tables') or []
+    if not tables or not tables[0].get('data'):
+        return {}
+    return parse_inst_table(tables[0]['fields'], tables[0]['data'], 'TPEX')
+
+
+def load_chip_cache():
+    try:
+        with open(CHIP_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_chip_cache(cache):
+    try:
+        keep = sorted(cache.keys())[-15:]  # 過去的日期資料不會再變，留近15天就夠
+        with open(CHIP_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({k: cache[k] for k in keep}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _cache_get(cache, key, market):
+    v = cache.get(key, {}).get(market)
+    return None if v is None else {c: (int(a), int(b)) for c, (a, b) in v.items()}
+
+
+def _cache_put(cache, key, market, data):
+    cache.setdefault(key, {})[market] = {c: [a, b] for c, (a, b) in data.items()}
+
+
+def ensure_chip_data():
+    """每天只在第一輪(或失敗後每15分鐘)抓一次近N個交易日的法人資料，其餘輪次直接用記憶體裡的結果。"""
+    if not CHIP_FILTER_ENABLED:
+        return
+    today = datetime.now(TAIWAN_TZ).date()
+    all_ok = CHIP['ok']['TWSE'] and CHIP['ok']['TPEX']
+    if CHIP['date'] == today and (all_ok or time.time() - CHIP['last_try'] < CHIP_RETRY_SECONDS):
+        return
+    CHIP['date'] = today
+    CHIP['last_try'] = time.time()
+
+    cache = load_chip_cache()
+    ok = {'TWSE': True, 'TPEX': True}
+    dates, twse_days, tpex_days = [], {}, {}
+
+    # 上市：往前找出最近 N 個「有開盤」的交易日(休市日官方回傳空資料，自動跳過)
+    try:
+        d, scanned = today, 0
+        while len(dates) < CHIP_LOOKBACK_DAYS and scanned < 20:
+            d -= timedelta(days=1)
+            scanned += 1
+            if d.weekday() >= 5:
+                continue
+            key = d.isoformat()
+            data = _cache_get(cache, key, 'TWSE')
+            if data is None:
+                data = fetch_twse_day(d)
+                _cache_put(cache, key, 'TWSE', data)
+                time.sleep(1.5)  # 證交所對連續請求很敏感，放慢一點
+            if data:
+                dates.append(d)
+                twse_days[d] = data
+        if not dates:
+            raise RuntimeError("找不到任何一個交易日的上市法人資料")
+    except Exception as e:
+        ok['TWSE'] = False
+        print(f"⚠️ 上市法人資料取得失敗：{e}")
+
+    # 上櫃：用同樣的交易日
+    if dates:
+        try:
+            for d in dates:
+                key = d.isoformat()
+                data = _cache_get(cache, key, 'TPEX')
+                if not data:
+                    data = fetch_tpex_day(d)
+                    if not data:
+                        raise RuntimeError(f"{key} 櫃買中心沒有回傳資料")
+                    _cache_put(cache, key, 'TPEX', data)
+                    time.sleep(1.5)
+                tpex_days[d] = data
+        except Exception as e:
+            ok['TPEX'] = False
+            print(f"⚠️ 上櫃法人資料取得失敗：{e}")
+    else:
+        ok['TPEX'] = False
+
+    def total_lots(days):
+        net = {}
+        for data in days.values():
+            for code, (f, t) in data.items():
+                net[code] = net.get(code, 0) + f + t
+        return {c: v / 1000 for c, v in net.items()}  # 股 -> 張
+
+    CHIP['net'] = {'TWSE': total_lots(twse_days) if ok['TWSE'] else {},
+                   'TPEX': total_lots(tpex_days) if ok['TPEX'] else {}}
+    CHIP['ok'] = ok
+    CHIP['dates'] = dates
+    save_chip_cache(cache)
+    print(f"🏦 法人資料：交易日 {', '.join(x.isoformat() for x in sorted(dates)) or '無'}｜"
+          f"上市 {len(CHIP['net']['TWSE'])} 檔{'✅' if ok['TWSE'] else '❌'}、"
+          f"上櫃 {len(CHIP['net']['TPEX'])} 檔{'✅' if ok['TPEX'] else '❌'}")
+
+
+def chip_check(code, suffix):
+    """回傳 (是否通過, 近N日外資+投信淨買超張數)。
+    True=大戶有買、False=沒買、None=無法判斷(條件關閉或資料抓失敗)。無法判斷時不擋訊號，避免資料源故障整天都沒訊號。"""
+    if not CHIP_FILTER_ENABLED or suffix is None:
+        return None, None
+    market = 'TWSE' if suffix == '.TW' else 'TPEX'
+    if not CHIP['ok'][market]:
+        return None, None
+    net_lots = CHIP['net'][market].get(code, 0.0)  # 法人完全沒交易的股票 = 0 = 不算買進
+    return net_lots > CHIP_MIN_NET_LOTS, net_lots
+
+
+def chip_note():
+    if not CHIP_FILTER_ENABLED:
+        return ""
+    miss = [name for m, name in (('TWSE', '上市'), ('TPEX', '上櫃')) if not CHIP['ok'][m]]
+    return f"⚠️ {'、'.join(miss)}法人資料取得失敗，該市場本次未套用大戶條件\n" if miss else ""
+
+
 def main():
     if not is_market_hours():
         print("目前非台股交易時間 (平日 9:00-13:30)，跳過本次掃描。")
@@ -537,15 +770,17 @@ def main():
 
     print("🚀 啟動雙核掃描 (自動辨識上市/上櫃通道，含時間校正 + 相對量能)...")
 
-    # --- 階段一：預設抓取上市 (.TW)，分批下載避免一次500檔太多造成整批誤判 ---
-    tickers_tw = [f"{code}.TW" for code in WATCH_STOCKS.keys()]
-    data_tw = chunked_download(tickers_tw, period="1d", interval="1m")
+    # --- 階段一：已知是上櫃的直接走 .TWO，其餘(含第一輪還沒有對照表時)先試 .TW ---
+    tw_codes = [c for c in WATCH_STOCKS if SUFFIX_CACHE.get(c, '.TW') == '.TW']
+    known_two = [c for c in WATCH_STOCKS if SUFFIX_CACHE.get(c) == '.TWO']
+
+    data_tw = chunked_download([f"{c}.TW" for c in tw_codes], period="1d", interval="1m")
 
     valid_data = {}
     ticker_suffix_map = {}
     missing_codes = []
 
-    for code in WATCH_STOCKS.keys():
+    for code in tw_codes:
         ticker_tw = f"{code}.TW"
         if ticker_tw in data_tw and not data_tw[ticker_tw].empty:
             valid_data[code] = data_tw[ticker_tw].dropna()
@@ -553,16 +788,18 @@ def main():
         else:
             missing_codes.append(code)
 
-    # --- 階段二：找不到的改抓上櫃 (.TWO)，同樣分批下載 ---
-    if missing_codes:
-        tickers_two = [f"{code}.TWO" for code in missing_codes]
-        data_two = chunked_download(tickers_two, period="1d", interval="1m")
+    # --- 階段二：.TW 找不到的 + 已知上櫃的，抓上櫃 (.TWO) ---
+    codes_two = missing_codes + known_two
+    if codes_two:
+        data_two = chunked_download([f"{c}.TWO" for c in codes_two], period="1d", interval="1m")
 
-        for code in missing_codes:
+        for code in codes_two:
             ticker_two = f"{code}.TWO"
             if ticker_two in data_two and not data_two[ticker_two].empty:
                 valid_data[code] = data_two[ticker_two].dropna()
                 ticker_suffix_map[code] = ".TWO"
+
+    SUFFIX_CACHE.update(ticker_suffix_map)
 
     # 清楚的總結：真正找不到資料的股票才需要關注，不用理會過程中.TW試錯的雜訊
     still_missing = [code for code in WATCH_STOCKS if code not in valid_data]
@@ -573,10 +810,25 @@ def main():
         print(f"⚠️ 兩種通道都查無資料的代號({len(still_missing)}檔，可能是真的下市/興櫃/代碼有誤)："
               f"{', '.join(still_missing)}")
 
+    # --- 休市日檢查：休市時Yahoo會回傳上一個交易日的資料，不能把舊資料當今天掃 ---
+    latest_dates = []
+    for _df in valid_data.values():
+        if _df.empty:
+            continue
+        try:
+            latest_dates.append(_df.index[-1].tz_convert(TAIWAN_TZ).date())
+        except Exception:
+            pass
+    if latest_dates and max(latest_dates) < datetime.now(TAIWAN_TZ).date():
+        print(f"⏸ 最新K棒日期是 {max(latest_dates)}，不是今天(可能是休市日或Yahoo尚未更新)，跳過本次掃描。")
+        return
+
     # --- 階段三：取得日均量與日均金額基準(有快取就不重抓) ---
     baseline_dict = fetch_avg_volumes(ticker_suffix_map, CACHE_PATH)
 
     alert_state = load_alert_state(ALERT_STATE_PATH)
+    ensure_chip_data()
+    filtered_by_chip = []
     alerts = []
     diagnostic_records = []  # 用來印出「漲幅前幾名」的完整計算數據，方便事後對答案，不影響發送邏輯
 
@@ -601,6 +853,11 @@ def main():
         now_metrics = compute_metrics(df, open_price, avg_daily_volume, avg_turnover_billion)
         existing = alert_state.get(code)
 
+        chip_status, chip_net_lots = chip_check(code, ticker_suffix_map.get(code))
+        chip_line = ""
+        if chip_net_lots is not None:
+            chip_line = f"\n ↳ 🏦 法人近{CHIP_LOOKBACK_DAYS}日(外資+投信)：<code>{chip_net_lots:+,.0f}張</code>"
+
         diagnostic_records.append({
             'code': code, 'name': name,
             'percent_change': now_metrics['percent_change'],
@@ -610,6 +867,7 @@ def main():
             'strategy_3': now_metrics['strategy_3'],
             'avg_turnover_billion': avg_turnover_billion,
             'existing_severity': existing['severity'] if existing else None,
+            'chip_net_lots': chip_net_lots,
         })
 
         # --- 策略二(波段轉強)：抓的是「trend up」這個現象本身，不管前面有沒有跌深。
@@ -623,12 +881,18 @@ def main():
             # 不分是不是今天第一次、也不管那個低點跌得深不深，規則完全一致。
             wave_alert_ok = trough_key is not None and trough_key != prev_trough_key
 
+        # --- 大戶(法人)買進條件：外資+投信近N個交易日合計淨買超才放行，三種訊號都要過這一關 ---
+        if chip_status is False and (wave_alert_ok or now_metrics['strategy_1'] or now_metrics['strategy_3']):
+            filtered_by_chip.append(f"{code}{name}({now_metrics['percent_change']:+.1f}%)")
+            continue
+
         if wave_alert_ok:
             signal_type = "🔄波段轉強"
             severity = SEVERITY_VTURN
             extra_line = ""
             if existing is not None:
                 extra_line = "\n ↳ 🔁 新一波上升：先前拉回後再度轉強向上"
+            extra_line += chip_line
 
             alerts.append(
                 f"<b>{code} {name}</b> {signal_type}\n"
@@ -660,6 +924,7 @@ def main():
                     f"\n ↳ 量能倍數：<code>{now_metrics['relative_volume']:.1f}x</code>（相對該時段應有量）"
                     f"\n ↳ ⚠️ 僅能偵測「量能異常放大」，無法判斷是買方還是賣方主導，請自行確認方向"
                 )
+            extra_line += chip_line
 
             alerts.append(
                 f"<b>{code} {name}</b> {signal_type}\n"
@@ -673,8 +938,6 @@ def main():
                 'wave_trough_key': existing['wave_trough_key'] if existing else None,
             }
 
-    save_alert_state(ALERT_STATE_PATH, alert_state)
-
     # 診斷區：印出漲幅前10名的完整計算數據，不管有沒有觸發都印，
     # 之後如果又出現「別人抓到、我們沒發」的情況，直接對這段log就能查出是門檻沒到、
     # 還是資料/邏輯真的有問題，不用再用猜的。
@@ -684,14 +947,25 @@ def main():
     for r in top_movers:
         avg_to_str = f"{r['avg_turnover_billion']:.2f}億" if r['avg_turnover_billion'] is not None else "無資料"
         already = SEVERITY_LABELS.get(r['existing_severity'], '未知')
+        chip_str = f"{r['chip_net_lots']:+,.0f}張" if r.get('chip_net_lots') is not None else "未套用"
         print(f"   {r['code']} {r['name']}：漲幅{r['percent_change']:+.2f}% "
               f"❘ 今日金額{r['turnover_billion']:.2f}億 ❘ 日均金額{avg_to_str} "
               f"❘ 策略1={r['strategy_1']} 策略2={r['strategy_2']} 策略3={r['strategy_3']} "
-              f"❘ 今天已發過：{already}")
+              f"❘ 今天已發過：{already} ❘ 法人近{CHIP_LOOKBACK_DAYS}日：{chip_str}")
+
+    if filtered_by_chip:
+        print(f"🏦 被法人條件擋下 {len(filtered_by_chip)} 檔(近{CHIP_LOOKBACK_DAYS}日外資+投信沒有淨買超)："
+              + "、".join(filtered_by_chip))
 
     if alerts:
-        send_telegram("🤖 <b>Claude Real Time</b>\n🚨 盤中大戶監控 (新發動)\n━━━━━━━━━━━━━━\n" + "\n\n".join(alerts))
+        cond = f"｜法人近{CHIP_LOOKBACK_DAYS}日買超" if CHIP_FILTER_ENABLED else ""
+        header = f"🤖 <b>Claude Real Time</b>\n🚨 盤中大戶監控 (新發動{cond})\n{chip_note()}━━━━━━━━━━━━━━\n"
+        if send_alerts_chunked(header, alerts):
+            save_alert_state(ALERT_STATE_PATH, alert_state)
+        else:
+            print("⚠️ 訊息未全部送出成功，本輪不更新「已發送」紀錄，下一輪會再試。")
     else:
+        save_alert_state(ALERT_STATE_PATH, alert_state)
         print("目前無新發動、波段轉強或異常量能的股票。")
 
 
