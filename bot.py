@@ -73,6 +73,9 @@ SIZE_TIERS = [
 ]
 DEFAULT_BREAKOUT_PCT = 4.0     # 找不到分級資料(如新股)或小型股：維持原本嚴格門檻
 DEFAULT_REBOUND_PCT = 3.5
+# 今天已經發過訊號的股票，要「先前拉回至少這麼多百分點」再重新轉強，才算值得再發第二次的新一波；
+# 上升途中只是小小往下(例如1~2個百分點)就又上去，還是同一段行情，不重複發報。
+WAVE_REALERT_MIN_PULLBACK_PP = 3.0
 WAVE_REVERSAL_PP = 1.0  # zigzag轉折確認門檻：只要出現至少這麼多「百分點」的真實反轉，就算轉折點成立
 
 # 台股市值前500監控池
@@ -368,11 +371,14 @@ def find_current_wave_trough(pct_series, reversal_pp):
     現在進入下降波段；同理，從某個低點反彈超過reversal_pp個百分點，才確認那是真正的
     波段低點、現在進入上升波段。持續更新極值，直到反向超過門檻才翻轉。
 
-    回傳 (目前是否處於上升波段, 該波段起漲低點的漲跌幅%, 該低點在序列中的索引(用來跨執行辨識是否為新波段))。
-    如果現在不是處於上升波段(還在下跌或盤整)，回傳 (False, None, None)。
+    回傳 (目前是否處於上升波段, 該波段起漲低點的漲跌幅%, 該低點在序列中的索引(用來跨執行辨識是否為新波段),
+          起漲前的回檔幅度pp)。
+    回檔幅度 = 「這個低點之前的波段高點」減「這個低點」；如果這一波是從開盤後的第一個低點直接往上
+    (前面根本沒有高點)，回檔幅度是None。
+    如果現在不是處於上升波段(還在下跌或盤整)，回傳 (False, None, None, None)。
     """
     if len(pct_series) < 3:
-        return False, None, None
+        return False, None, None, None
 
     trend = None  # None(尚未確認方向) / 'up' / 'down'
     running_high = pct_series.iloc[0]
@@ -383,6 +389,8 @@ def find_current_wave_trough(pct_series, reversal_pp):
     extreme_idx = pct_series.index[0]
     trough_val = None
     trough_idx = None
+    peak_val = None       # 目前這段下降波段「之前」的波段高點
+    pullback_pp = None    # 目前這個起漲低點之前，從波段高點拉回了幾個百分點
 
     for idx, val in pct_series.items():
         if trend is None:
@@ -398,8 +406,10 @@ def find_current_wave_trough(pct_series, reversal_pp):
                     trend = 'up'
                     trough_val, trough_idx = running_low, running_low_idx
                     extreme_val, extreme_idx = running_high, running_high_idx
+                    pullback_pp = None
                 else:
                     trend = 'down'
+                    peak_val = running_high
                     extreme_val, extreme_idx = running_low, running_low_idx
             continue
 
@@ -408,6 +418,7 @@ def find_current_wave_trough(pct_series, reversal_pp):
                 extreme_val, extreme_idx = val, idx
             elif extreme_val - val >= reversal_pp:
                 trend = 'down'
+                peak_val = extreme_val   # 剛結束的上升波段高點，先記下來
                 extreme_val, extreme_idx = val, idx
         else:  # trend == 'down'
             if val <= extreme_val:
@@ -415,11 +426,12 @@ def find_current_wave_trough(pct_series, reversal_pp):
             elif val - extreme_val >= reversal_pp:
                 trend = 'up'
                 trough_val, trough_idx = extreme_val, extreme_idx
+                pullback_pp = (peak_val - extreme_val) if peak_val is not None else None
                 extreme_val, extreme_idx = val, idx
 
     if trend == 'up' and trough_idx is not None:
-        return True, trough_val, trough_idx
-    return False, None, None
+        return True, trough_val, trough_idx, pullback_pp
+    return False, None, None, None
 
 
 def get_size_tier(avg_turnover_billion):
@@ -473,7 +485,7 @@ def compute_metrics(df, open_price, avg_daily_volume, avg_turnover_billion):
     # 至於這個起漲低點是不是「新的」(還沒發過的波段)、以及第一波是否夠深(接近跌停)，
     # 交給main()裡的alert_state去判斷，因為那需要跨執行的歷史紀錄才能比對。
     pct_series = (df['Close'] - open_price) / open_price * 100
-    wave_in_uptrend, wave_trough_val, wave_trough_idx = find_current_wave_trough(pct_series, WAVE_REVERSAL_PP)
+    wave_in_uptrend, wave_trough_val, wave_trough_idx, wave_pullback_pp = find_current_wave_trough(pct_series, WAVE_REVERSAL_PP)
     wave_rebound_pp = (percent_change - wave_trough_val) if (wave_in_uptrend and wave_trough_val is not None) else 0
     strategy_2 = bool(
         wave_in_uptrend and wave_trough_val is not None and
@@ -505,6 +517,7 @@ def compute_metrics(df, open_price, avg_daily_volume, avg_turnover_billion):
         'strategy_3': strategy_3,
         'wave_trough_val': wave_trough_val,
         'wave_trough_idx': wave_trough_idx,
+        'wave_pullback_pp': wave_pullback_pp,
     }
 
 
@@ -829,6 +842,7 @@ def main():
     alert_state = load_alert_state(ALERT_STATE_PATH)
     ensure_chip_data()
     filtered_by_chip = []
+    shallow_wave_skipped = []
     alerts = []
     diagnostic_records = []  # 用來印出「漲幅前幾名」的完整計算數據，方便事後對答案，不影響發送邏輯
 
@@ -881,6 +895,15 @@ def main():
             # 不分是不是今天第一次、也不管那個低點跌得深不深，規則完全一致。
             wave_alert_ok = trough_key is not None and trough_key != prev_trough_key
 
+            # 今天已經發過訊號(不論哪一種)的股票，要「先前真的拉回夠深」才值得再發第二次。
+            # 上升途中只是小小往下就又彈上去，還是同一段行情，不重複發報(例如台星科)。
+            if wave_alert_ok and existing is not None:
+                pb = now_metrics['wave_pullback_pp']
+                if pb is None or pb < WAVE_REALERT_MIN_PULLBACK_PP:
+                    wave_alert_ok = False
+                    pb_txt = f"回檔{pb:.1f}pp" if pb is not None else "中途沒有回檔"
+                    shallow_wave_skipped.append(f"{code}{name}({pb_txt})")
+
         # --- 大戶(法人)買進條件：外資+投信近N個交易日合計淨買超才放行，三種訊號都要過這一關 ---
         if chip_status is False and (wave_alert_ok or now_metrics['strategy_1'] or now_metrics['strategy_3']):
             filtered_by_chip.append(f"{code}{name}({now_metrics['percent_change']:+.1f}%)")
@@ -891,7 +914,9 @@ def main():
             severity = SEVERITY_VTURN
             extra_line = ""
             if existing is not None:
-                extra_line = "\n ↳ 🔁 新一波上升：先前拉回後再度轉強向上"
+                pb = now_metrics['wave_pullback_pp']
+                pb_txt = f"{pb:.1f}pp" if pb is not None else "一段"
+                extra_line = f"\n ↳ 🔁 新一波上升：先前回檔{pb_txt}後再度轉強向上"
             extra_line += chip_line
 
             alerts.append(
@@ -953,6 +978,9 @@ def main():
               f"❘ 策略1={r['strategy_1']} 策略2={r['strategy_2']} 策略3={r['strategy_3']} "
               f"❘ 今天已發過：{already} ❘ 法人近{CHIP_LOOKBACK_DAYS}日：{chip_str}")
 
+    if shallow_wave_skipped:
+        print(f"↪️ 回檔不夠深(<{WAVE_REALERT_MIN_PULLBACK_PP}pp)，不重複發第二次波段轉強："
+              + "、".join(shallow_wave_skipped))
     if filtered_by_chip:
         print(f"🏦 被法人條件擋下 {len(filtered_by_chip)} 檔(近{CHIP_LOOKBACK_DAYS}日外資+投信沒有淨買超)："
               + "、".join(filtered_by_chip))
