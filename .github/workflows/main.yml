@@ -1,14 +1,14 @@
+
 name: 盤中大戶即時監控
 
 on:
   schedule:
-    # UTC 00:30 = 台灣 08:30。提早啟動，程式會自己等到開盤，用來吸收 GitHub 排程的延遲。
+    # UTC 00:30 = 台灣 08:30
     - cron: '30 0 * * 1-5'
-    # 備援：萬一上面那次被 GitHub 漏掉。有 concurrency 保護，不會重複執行。
+    # 備援排程
     - cron: '50 0 * * 1-5'
   workflow_dispatch:
 
-# 同一時間只允許一個監控在跑；備援那次會排隊，前一個結束(收盤)後它會發現已收盤就直接結束
 concurrency:
   group: intraday-monitor
   cancel-in-progress: false
@@ -16,7 +16,7 @@ concurrency:
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 330   # 08:30 ~ 13:35 約 5 小時，留一點餘裕
+    timeout-minutes: 330
 
     steps:
       - name: 取得程式碼
@@ -30,6 +30,26 @@ jobs:
 
       - name: 安裝所需套件
         run: pip install -r requirements.txt
+
+      - name: 讓 Telegram 股票名稱直連籌碼K線
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('bot.py')
+          code = p.read_text(encoding='utf-8')
+          old = 'f"<b>{code} {name}</b> {signal_type}\\n"'
+          new = (
+              'f\'<a href="https://www.cmoney.tw/finance/{code}/stockmainkline">'
+              '<b>{code} {name}</b></a> {signal_type}\\n\''
+          )
+          count = code.count(old)
+          if count != 2:
+              raise SystemExit(f'預期找到 2 處 Telegram 股票名稱，實際找到 {count} 處，停止修改以避免誤改')
+          p.write_text(code.replace(old, new), encoding='utf-8')
+          print('✅ Telegram 股票名稱已加上籌碼K線個股連結（2 處）')
+          PY
 
       - name: 執行盤中循環掃描
         env:
