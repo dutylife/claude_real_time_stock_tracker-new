@@ -2,34 +2,38 @@ name: 盤中大戶即時監控
 
 on:
   schedule:
-    # 設定為 UTC 時間 01:00-05:59 (台灣時間 09:00-13:59)，週一到週五，每 5 分鐘執行一次
-    - cron: '*/5 1-5 * * 1-5'
-  
-  # 保留手動執行的按鈕，方便你隨時測試
+    # UTC 00:30 = 台灣 08:30。提早啟動，程式會自己等到開盤，用來吸收 GitHub 排程的延遲。
+    - cron: '30 0 * * 1-5'
+    # 備援：萬一上面那次被 GitHub 漏掉。有 concurrency 保護，不會重複執行。
+    - cron: '50 0 * * 1-5'
   workflow_dispatch:
+
+# 同一時間只允許一個監控在跑；備援那次會排隊，前一個結束(收盤)後它會發現已收盤就直接結束
+concurrency:
+  group: intraday-monitor
+  cancel-in-progress: false
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 330   # 08:30 ~ 13:35 約 5 小時，留一點餘裕
 
     steps:
       - name: 取得程式碼
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: 設定 Python 環境
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: pip
 
       - name: 安裝所需套件
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: 執行盤中掃描
+      - name: 執行盤中循環掃描
         env:
-          # 這裡已經修正為你在 GitHub 裡設定的 TELEGRAM_BOT_TOKEN
+          PYTHONUNBUFFERED: '1'
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python bot.py
+        run: python run_loop.py
