@@ -1,11 +1,10 @@
 """
-盤中循環執行器：GitHub Actions 只啟動一次，程式自己在交易時段內每 5 分鐘呼叫一次 bot.main()。
+盤中循環執行器：GitHub Actions 只啟動一次，程式自己在交易時段內反覆呼叫 bot.main()。
 
-好處：
-1. 排程延遲只影響「啟動」那一次，之後的掃描節奏由程式自己控制。
-2. 整段交易時間在同一個執行環境裡，alert_state.csv / avg_volume_cache.csv 一直都在，
-   「同一檔今天只發一次」和日均量快取自然生效，不用另外做 cache。
-3. 只安裝一次套件。
+- 開盤前：先備好上市/上櫃對照、近20日均量、法人資料，開盤第一輪就能立刻掃描。
+- 即時來源(證交所)正常時：約每 60 秒掃一次，訊號落後行情只有幾秒到一分鐘。
+- 即時來源失敗：先略過那一輪、下一分鐘再試；連續失敗才退回 Yahoo(資料延遲約20分鐘)，改成約每 5 分鐘掃一次。
+- 收盤：13:32 前結束。
 """
 import time
 import traceback
@@ -18,9 +17,10 @@ import bot  # 修正後的 bot.py
 
 TZ = ZoneInfo("Asia/Taipei")
 OPEN_T = dtime(9, 0)
-CLOSE_T = dtime(13, 35)
+CLOSE_T = dtime(13, 32)          # 13:30 收盤，多留 2 分鐘抓最後的收盤價
 HOLIDAY_CHECK_T = dtime(9, 45)   # Yahoo 1分K有延遲，開盤初期查不到今天資料是正常的，所以晚一點再判斷休市
-INTERVAL_MIN = 5
+REALTIME_INTERVAL_SEC = 60       # 即時來源：每輪間隔(從「開始掃描」算起)
+YAHOO_INTERVAL_SEC = 300         # Yahoo 備援：每輪間隔
 
 
 def now_tw():
@@ -50,13 +50,6 @@ def has_today_data():
         return True  # 查詢失敗時當作有開盤，不要誤殺
 
 
-def next_slot(after):
-    """下一個「分鐘為 5 的倍數」的時間點，再加 15 秒讓那根 K 棒補齊。"""
-    minute = (after.minute // INTERVAL_MIN + 1) * INTERVAL_MIN
-    base = after.replace(minute=0, second=0, microsecond=0)
-    return base + timedelta(minutes=minute, seconds=15)
-
-
 def main():
     n = now_tw()
     if n.weekday() >= 5:
@@ -66,8 +59,12 @@ def main():
         print("已過收盤時間，結束。")
         return
 
-    # 排程會提早啟動（吸收 GitHub 的延遲），先等到開盤
-    sleep_until(at_today(OPEN_T) + timedelta(minutes=2))
+    # 排程會提早啟動(吸收 GitHub 的延遲)：先把開盤第一輪需要的東西備好，再等開盤
+    try:
+        bot.prewarm()
+    except Exception:
+        traceback.print_exc()
+    sleep_until(at_today(OPEN_T) + timedelta(seconds=10))
 
     print(f"✅ 開始循環掃描，台北時間 {now_tw():%H:%M:%S}")
     holiday_checked = False
@@ -78,13 +75,16 @@ def main():
                 print("9:45 仍沒有今天的資料，判斷為休市日，結束。")
                 return
 
-        print(f"\n=== 掃描 {now_tw():%H:%M:%S} ===")
+        started = now_tw()
+        print(f"\n=== 掃描 {started:%H:%M:%S} ===")
         try:
             bot.main()
         except Exception:
             traceback.print_exc()  # 單次失敗不讓整個循環掛掉
 
-        target = next_slot(now_tw())
+        # 即時來源(或剛略過一輪、準備重試)每分鐘一輪；退回 Yahoo 時每 5 分鐘一輪
+        interval = REALTIME_INTERVAL_SEC if bot.SCAN.get('source') in ('realtime', 'skip') else YAHOO_INTERVAL_SEC
+        target = max(started + timedelta(seconds=interval), now_tw())
         if target.time() > CLOSE_T:
             break
         sleep_until(target)
